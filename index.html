@@ -409,8 +409,25 @@
                 <li>至 Google AI Studio：<a href="https://aistudio.google.com/apikey" target="_blank" class="text-indigo-600 underline font-mono">aistudio.google.com/apikey</a></li>
                 <li>登入後點擊「<b>Create API key</b>」建立金鑰。</li>
                 <li>複製並貼上後點擊「<b>儲存</b>」即可啟用真人多角色語音與 AI 翻譯辭典。</li>
-                <li class="text-slate-500">🔒 金鑰儲存於本機電腦，不會上傳至其他伺服器。</li>
+                <li class="text-slate-500">🔒 金鑰儲存於本機電腦/手機，不會上傳至任何第三方伺服器。</li>
               </ol>
+            </div>
+
+            <!-- 手機同步金鑰小工具 -->
+            <div id="syncToMobileSection" class="pt-2 border-t border-slate-200/70 flex flex-wrap items-center justify-between gap-2">
+              <span class="text-[11px] text-slate-500 font-medium flex items-center gap-1.5">
+                <i class="fa-solid fa-mobile-screen-button text-indigo-500"></i> 手機同步此金鑰：
+              </span>
+              <div class="flex items-center gap-1.5">
+                <button type="button" id="showQrSyncBtn" class="text-xs px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold rounded-lg border border-indigo-200 flex items-center gap-1 transition shadow-xs">
+                  <i class="fa-solid fa-qrcode text-indigo-600"></i>
+                  <span>手機掃碼同步</span>
+                </button>
+                <button type="button" id="copySyncUrlBtn" class="text-xs px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-lg border border-slate-200 flex items-center gap-1 transition">
+                  <i class="fa-solid fa-link text-slate-500"></i>
+                  <span>複製手機連結</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -424,6 +441,31 @@
           </button>
         </div>
 
+      </div>
+    </div>
+
+    <!-- 📱 手機掃碼同步 API Key Modal -->
+    <div id="qrModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm transition-opacity">
+      <div class="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-sm w-full p-5 space-y-4 animate-scale-up text-center" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-slate-100 pb-2.5">
+          <h3 class="text-sm font-bold text-slate-900 flex items-center gap-1.5">
+            <i class="fa-solid fa-qrcode text-indigo-600"></i> 手機掃碼同步金鑰
+          </h3>
+          <button onclick="closeQrModal()" class="text-slate-400 hover:text-slate-600 p-1 rounded-lg hover:bg-slate-100">
+            <i class="fa-solid fa-xmark text-base"></i>
+          </button>
+        </div>
+        <p class="text-xs text-slate-500 leading-relaxed">
+          請用手機相機直接掃描下方 QR Code，在手機開啟後將<b>自動同步您的 Gemini API Key</b>，即可享受與電腦版完全一致的高音質真人發音！
+        </p>
+        <div class="flex justify-center p-3 bg-slate-50 rounded-xl border border-slate-200">
+          <img id="qrCodeImg" src="" alt="QR Code" class="w-48 h-48 rounded-lg shadow-xs">
+        </div>
+        <div class="flex justify-center">
+          <button onclick="closeQrModal()" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl text-xs transition">
+            完成關閉
+          </button>
+        </div>
       </div>
     </div>
 
@@ -858,6 +900,8 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
     // 音訊與快取狀態
     let cachedFullAudioUrl = null;
     let cachedLineUrls = {};
+    let cachedLineBuffers = {};
+    let cachedFullBuffer = null;
     let isGenerating = false;
     let singleAudio = new Audio();
     let wordAudio = new Audio();
@@ -1652,20 +1696,23 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
             const mimeType = part?.inlineData?.mimeType;
 
             if (audioData && mimeType && mimeType.startsWith("audio/")) {
+              let wavBuffer;
+              let wavBlob;
               // 支援原生 WAV 封裝（如 gemini-3.8 系列）
               if (mimeType.includes("wav") || mimeType === "audio/x-wav") {
-                const wavBuffer = base64ToArrayBuffer(audioData);
-                const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
-                return URL.createObjectURL(wavBlob);
+                wavBuffer = base64ToArrayBuffer(audioData);
+                wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
               } else {
                 // 原始 PCM 16-bit 封裝為標準 WAV
                 const sampleRateMatch = mimeType.match(/rate=(\d+)/);
                 const sampleRate = sampleRateMatch ? parseInt(sampleRateMatch[1], 10) : 24000;
                 const pcmBuffer = base64ToArrayBuffer(audioData);
                 const pcm16 = new Int16Array(pcmBuffer);
-                const wavBlob = pcmToWav(pcm16, sampleRate);
-                return URL.createObjectURL(wavBlob);
+                wavBlob = pcmToWav(pcm16, sampleRate);
+                wavBuffer = pcmBuffer;
               }
+              const url = URL.createObjectURL(wavBlob);
+              return { url: url, buffer: wavBuffer };
             }
             throw new Error("伺服器回傳無效音訊資料");
           } catch (error) {
@@ -1808,15 +1855,9 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       } catch (e) {}
     }
 
-    // 萬用行動裝置相容音訊播放器 (優先 HTML5，失敗時自動 Web Audio 解碼播放)
-    async function playAudioUniversal(audioEl, blobUrl, speed, onEnded, onError) {
-      if (!audioEl) {
-        if (onError) onError(new Error("No audio element"));
-        return;
-      }
-
-      audioEl.src = blobUrl;
-      audioEl.playbackRate = speed || 1.0;
+    // 萬用行動裝置相容音訊播放器 (行動端優先使用 Web Audio API 解碼播放，確保聲音與長度跟電腦版 100% 一致)
+    async function playAudioUniversal(audioEl, blobUrl, speed, onEnded, onError, rawBuffer) {
+      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
       let endedTriggered = false;
       const handleEnded = () => {
@@ -1825,11 +1866,24 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
         if (onEnded) onEnded();
       };
 
+      // 行動端優先使用 Web Audio 解碼，完全不受 iOS Safari blob: URL 異常或音訊中斷影響
+      if (isMobile) {
+        const success = await playWavViaWebAudio(blobUrl, speed, handleEnded, rawBuffer);
+        if (success) return;
+      }
+
+      if (!audioEl) {
+        if (onError) onError(new Error("No audio element"));
+        return;
+      }
+
+      audioEl.src = blobUrl;
+      audioEl.playbackRate = speed || 1.0;
       audioEl.onended = handleEnded;
 
       audioEl.onerror = async (err) => {
-        console.warn("HTML5 audio.onerror on mobile, attempting WebAudio fallback:", err);
-        const success = await playWavViaWebAudio(blobUrl, speed, handleEnded);
+        console.warn("HTML5 audio.onerror, fallback to WebAudio:", err);
+        const success = await playWavViaWebAudio(blobUrl, speed, handleEnded, rawBuffer);
         if (!success && onError) {
           onError(err);
         }
@@ -1842,8 +1896,8 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
           audioEl.playbackRate = speed || 1.0;
         }
       } catch (err) {
-        console.warn("HTML5 audio.play() blocked on mobile, falling back to WebAudio:", err);
-        const success = await playWavViaWebAudio(blobUrl, speed, handleEnded);
+        console.warn("HTML5 audio.play() blocked, fallback to WebAudio:", err);
+        const success = await playWavViaWebAudio(blobUrl, speed, handleEnded, rawBuffer);
         if (!success && onError) {
           onError(err);
         }
@@ -1851,7 +1905,7 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
     }
 
     // Web Audio WAV 解碼播放備援 (徹底免疫 iOS Safari 自動播放政策阻擋)
-    async function playWavViaWebAudio(blobUrl, speed, onEnded) {
+    async function playWavViaWebAudio(blobUrl, speed, onEnded, rawBuffer) {
       try {
         const ctx = getGlobalAudioContext();
         if (!ctx) return false;
@@ -1864,8 +1918,14 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
           currentWebAudioSource = null;
         }
 
-        const res = await fetch(blobUrl);
-        const arrayBuf = await res.arrayBuffer();
+        let arrayBuf;
+        if (rawBuffer && rawBuffer.byteLength > 0) {
+          arrayBuf = rawBuffer.slice(0); // slice to prevent detaching
+        } else {
+          const res = await fetch(blobUrl);
+          arrayBuf = await res.arrayBuffer();
+        }
+
         const audioBuf = await ctx.decodeAudioData(arrayBuf);
 
         const source = ctx.createBufferSource();
@@ -1902,9 +1962,14 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       if (badge) {
         badge.classList.remove("hidden");
         const prefix = isSequentialMode ? `[逐句 ${idx + 1}/${dialogueData.length}] ` : '';
+        const hasKey = !!getApiKey();
+        const engineLabel = hasKey ? 'AI 真人音' : '⚠️ 手機內建語音';
+        badge.className = hasKey 
+          ? "text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 animate-pulse" 
+          : "text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 animate-pulse";
         badge.textContent = currentRepeatSetting === "loop"
-          ? `${prefix}循環中 (第 ${currentIteration} 遍)`
-          : `${prefix}第 ${currentIteration}/${currentRepeatSetting} 次`;
+          ? `[${engineLabel}] ${prefix}循環中 (第 ${currentIteration} 遍)`
+          : `[${engineLabel}] ${prefix}第 ${currentIteration}/${currentRepeatSetting} 次`;
       }
 
       audioStatusText.textContent = isSequentialMode
@@ -1929,8 +1994,9 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
             }
           };
 
-          const wavUrl = await fetchGeminiTTSWithRetry(payload);
-          cachedLineUrls[idx] = wavUrl;
+          const resObj = await fetchGeminiTTSWithRetry(payload);
+          cachedLineUrls[idx] = resObj.url;
+          cachedLineBuffers[idx] = resObj.buffer;
         }
 
         btn.innerHTML = `<i class="fa-solid fa-stop text-rose-500 text-lg"></i>`;
@@ -1939,7 +2005,8 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
           cachedLineUrls[idx],
           currentSpeed,
           () => handleSingleLineCompletion(idx),
-          () => speakFallbackSingle(item.text, (currentSpeakerMode === "single" ? "A" : item.role), () => handleSingleLineCompletion(idx))
+          () => speakFallbackSingle(item.text, (currentSpeakerMode === "single" ? "A" : item.role), () => handleSingleLineCompletion(idx)),
+          cachedLineBuffers[idx]
         );
       } catch (e) {
         console.error("Single line play error:", e);
@@ -2061,8 +2128,9 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
           };
         }
 
-        const wavUrl = await fetchGeminiTTSWithRetry(payload);
-        cachedFullAudioUrl = wavUrl;
+        const resObj = await fetchGeminiTTSWithRetry(payload);
+        cachedFullAudioUrl = resObj.url;
+        cachedFullBuffer = resObj.buffer;
 
         audioContainer.classList.remove("hidden");
         downloadAudioBtn.classList.remove("hidden");
@@ -2076,7 +2144,8 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
             highlightLine(-1);
             updatePlayButtonState();
           },
-          () => playFallbackFull()
+          () => playFallbackFull(),
+          cachedFullBuffer
         );
         showToast((currentSpeakerMode === "single") ? "已成功連線 Gemini 生成真人朗讀語音！" : "已成功連線 Gemini 生成雙角色真人語音！", "success");
       } catch (err) {
@@ -2574,11 +2643,87 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
     window.addEventListener("click", unlockAudioOnFirstGesture, { once: true });
     window.addEventListener("touchstart", unlockAudioOnFirstGesture, { once: true });
 
+    
+    // QR Code 與跨裝置金鑰同步
+    window.closeQrModal = function() {
+      const modal = document.getElementById("qrModal");
+      if (modal) modal.classList.add("hidden");
+    };
+
+    const qrModal = document.getElementById("qrModal");
+    if (qrModal) {
+      qrModal.addEventListener("click", (e) => {
+        if (e.target === qrModal) closeQrModal();
+      });
+    }
+
+    const showQrSyncBtn = document.getElementById("showQrSyncBtn");
+    const copySyncUrlBtn = document.getElementById("copySyncUrlBtn");
+
+    function getSyncUrl() {
+      const key = getApiKey();
+      if (!key) return null;
+      const base = window.location.origin + window.location.pathname;
+      return `${base}?key=${encodeURIComponent(key)}`;
+    }
+
+    if (showQrSyncBtn) {
+      showQrSyncBtn.addEventListener("click", () => {
+        const syncUrl = getSyncUrl();
+        if (!syncUrl) {
+          showToast("請先在上方輸入並儲存有效的 Gemini API Key 才能同步至手機！", "error");
+          return;
+        }
+        const qrImg = document.getElementById("qrCodeImg");
+        if (qrImg) {
+          qrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(syncUrl)}`;
+        }
+        if (qrModal) qrModal.classList.remove("hidden");
+      });
+    }
+
+    if (copySyncUrlBtn) {
+      copySyncUrlBtn.addEventListener("click", async () => {
+        const syncUrl = getSyncUrl();
+        if (!syncUrl) {
+          showToast("請先在上方輸入並儲存有效的 Gemini API Key 才能複製同步連結！", "error");
+          return;
+        }
+        try {
+          await navigator.clipboard.writeText(syncUrl);
+          showToast("✅ 已複製手機同步連結！您可以透過 LINE、微信或 AirDrop 傳送到手機打開，即可瞬間完成金鑰設定！", "success");
+        } catch (e) {
+          prompt("請手動複製以下手機專用同步連結：", syncUrl);
+        }
+      });
+    }
+
+    // 自動從 URL 參數匯入 API Key (例如從電腦掃描 QR Code 或點擊分享連結)
+    function checkUrlApiKeyImport() {
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.has('key') || urlParams.has('apikey') || urlParams.has('k')) {
+          const importedKey = (urlParams.get('key') || urlParams.get('apikey') || urlParams.get('k')).trim();
+          if (importedKey.startsWith('AIzaSy') || importedKey.length > 20) {
+            localStorage.setItem('gemini_api_key', importedKey);
+            if (apiKeyInput) apiKeyInput.value = importedKey;
+            updateApiKeyStatus(true);
+            resetAudioCache();
+            window.history.replaceState({}, document.title, window.location.pathname);
+            showToast("🎉 已成功自動同步 Gemini API Key！已為您的手機啟用頂級真人音色！", "success");
+            return true;
+          }
+        }
+      } catch (e) {}
+      return false;
+    }
+
     // 初始化載入
     updateVoiceBadges();
     setupPracticeControls();
     updateChineseToggleState();
     setSpeakerMode(currentSpeakerMode, false);
+    checkUrlApiKeyImport();
     setTargetLanguage(currentLanguage, true);
     checkMobileTipBanner();
   </script>
