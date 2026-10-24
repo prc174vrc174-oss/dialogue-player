@@ -886,7 +886,7 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       return { text, translation };
     }
 
-    // 解析劇本文字 (支援單人朗讀與雙人對話)
+    // 解析劇本文字 (支援單人朗讀與雙人對話，全面相容 Markdown 粗體 **A:** 與 [A]: 格式)
     function parseScriptText(rawText) {
       const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
       const parsed = [];
@@ -894,10 +894,14 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       const isSingle = (currentSpeakerMode === "single");
 
       lines.forEach((line, idx) => {
-        const match = line.match(/^([A-Za-z0-9_\u4e00-\u9fa5\s]+)[:：]\s*(.+)$/);
+        let cleanLine = line.trim();
+        // 匹配例如：**A:**、**A**:、*A:*、[Speaker A]:、Speaker 1:、A:、A：、1:
+        const match = cleanLine.match(/^(?:\*{1,2}|\[)?([A-Za-z0-9_\u4e00-\u9fa5\s]+?)(?:\*{1,2}|\])?[:：]\s*(.+)$/);
         if (match) {
-          const rawSpeaker = match[1].trim();
-          const content = match[2].trim();
+          const rawSpeaker = match[1].replace(/[\*_\[\]]/g, '').trim();
+          let content = match[2].trim();
+          // 清除內容開頭若仍殘留的 ** 或 * 符號
+          content = content.replace(/^\*{1,2}\s*/, '').replace(/\s*\*{1,2}$/, '').trim();
           let role = "A";
           
           if (isSingle) {
@@ -926,8 +930,10 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
             translation: extracted.translation
           });
         } else {
+          // 清理可能存在的開頭 markdown 粗體標記
+          let plainLine = cleanLine.replace(/^\*{1,2}\s*/, '').replace(/\s*\*{1,2}$/, '').trim();
           const role = isSingle ? "A" : (idx % 2 === 0 ? "A" : "B");
-          const extracted = extractTextAndTranslation(line);
+          const extracted = extractTextAndTranslation(plainLine);
           parsed.push({
             speaker: isSingle ? "Speaker A" : (role === "A" ? "Speaker A" : "Speaker B"),
             displayName: isSingle ? "朗讀" : (role === "A" ? "Speaker A" : "Speaker B"),
@@ -1076,15 +1082,49 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       }
     };
 
+    // 呼叫 Gemini 語言文字模型 (支援 gemini-2.0-flash 與自動多模型容錯降級)
+    async function callGeminiTextModel(payload) {
+      const apiKey = getApiKey();
+      if (!apiKey) throw new Error("未設定 API Key");
+
+      const candidateModels = [
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest"
+      ];
+      let lastError = null;
+
+      for (const model of candidateModels) {
+        try {
+          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+          const response = await fetch(apiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+
+          if (response.ok) {
+            return await response.json();
+          }
+
+          const errData = await response.json().catch(() => null);
+          const msg = errData?.error?.message || `HTTP ${response.status}`;
+          lastError = new Error(msg);
+          // 若遇 404 (模型名稱不相容) 或 429，嘗試下一個候選模型
+          if (response.status === 404 || response.status === 429) {
+            continue;
+          }
+          break;
+        } catch (e) {
+          lastError = e;
+        }
+      }
+      throw lastError || new Error("無法連線至 Gemini 文字模型");
+    }
+
     // 透過 Gemini 獲取多國語言之精準繁體中文辭典解釋、詞性與發音
     async function fetchWordDefinitionFromGemini(word) {
-      const apiKey = getApiKey();
-      if (!apiKey) {
-        throw new Error("未設定 API Key");
-      }
       const langInfo = languages[currentLanguage] || languages.en;
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-
       const payload = {
         contents: [
           {
@@ -1125,52 +1165,83 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
         }
       };
 
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      if (!response.ok) {
-        throw new Error(`API Error HTTP ${response.status}`);
-      }
-
-      const result = await response.json();
+      const result = await callGeminiTextModel(payload);
       const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!text) throw new Error("無回傳內容");
       return JSON.parse(text);
     }
 
-    // 備援字典查詢
+    // 備援字典查詢 (支援 MyMemory 中文釋義與 FreeDictionary 發音)
     async function tryFallbackDictionary(cleanWord) {
       try {
-        const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`);
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        const entry = data[0];
-        const senses = [];
+        const langInfo = languages[currentLanguage] || languages.en;
+        const myMemoryLang = langInfo.code === 'fil' ? 'tl' : langInfo.code;
+        
+        let entry = null;
+        let phonetic = `/${langInfo.name}發音/`;
+        let senses = [];
 
-        entry.meanings?.forEach(m => {
-          const pos = m.partOfSpeech || "詞性未註明";
-          m.definitions?.slice(0, 2).forEach(d => {
-            senses.push({
-              partOfSpeech: pos,
-              posCode: pos.slice(0, 3),
-              chineseMeaning: d.definition,
-              englishDefinition: d.definition,
-              exampleEn: d.example || "",
-              exampleZh: ""
+        // 1. 若為英文，嘗試取得國際音標與詞性定義
+        if (langInfo.code === 'en') {
+          try {
+            const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`);
+            if (res.ok) {
+              const data = await res.json();
+              entry = data[0];
+              if (entry?.phonetic) phonetic = entry.phonetic;
+              else if (entry?.phonetics?.[0]?.text) phonetic = entry.phonetics[0].text;
+            }
+          } catch (e) {}
+        }
+
+        // 2. 取得繁體中文釋義
+        let chineseTrans = "";
+        try {
+          const transRes = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(cleanWord)}&langpair=${myMemoryLang}|zh-TW`);
+          if (transRes.ok) {
+            const transData = await transRes.json();
+            chineseTrans = transData?.responseData?.translatedText || "";
+            if (chineseTrans.toLowerCase() === cleanWord.toLowerCase()) chineseTrans = "";
+          }
+        } catch (e) {}
+
+        if (entry?.meanings?.length > 0) {
+          entry.meanings.forEach((m, mIdx) => {
+            const pos = m.partOfSpeech || "詞性未註明";
+            m.definitions?.slice(0, 2).forEach((d, dIdx) => {
+              senses.push({
+                partOfSpeech: pos,
+                posCode: pos.slice(0, 3),
+                chineseMeaning: (mIdx === 0 && dIdx === 0 && chineseTrans) ? chineseTrans : (chineseTrans || d.definition),
+                englishDefinition: d.definition,
+                exampleEn: d.example || "",
+                exampleZh: ""
+              });
             });
           });
-        });
+        } else if (chineseTrans) {
+          senses.push({
+            partOfSpeech: "常用繁體中文釋義",
+            posCode: "詞義",
+            chineseMeaning: chineseTrans,
+            englishDefinition: "",
+            exampleEn: "",
+            exampleZh: ""
+          });
+        }
 
-        const fallbackObj = {
-          word: cleanWord,
-          phonetic: entry.phonetic || "/英語發音/",
-          inflectionNote: "",
-          senses: senses.slice(0, 3)
-        };
-        renderModalData(fallbackObj);
+        if (senses.length > 0) {
+          const fallbackObj = {
+            word: cleanWord,
+            phonetic: phonetic,
+            inflectionNote: "離線備援釋義",
+            senses: senses.slice(0, 3)
+          };
+          renderModalData(fallbackObj);
+          return;
+        }
+
+        throw new Error("無釋義");
       } catch (e) {
         modalPhonetic.textContent = "/發音就緒/";
         modalContent.innerHTML = `
@@ -1691,7 +1762,7 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
           const selectedVoice = (currentSpeakerMode === "single" || item.role === "A") ? voiceASelect.value : voiceBSelect.value;
           const payload = {
             contents: [{
-              parts: [{ text: item.text }]
+              parts: [{ text: item.text.replace(/[\*_]/g, "").trim() }]
             }],
             generationConfig: {
               responseModalities: ["AUDIO"],
@@ -1802,7 +1873,7 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       try {
         let payload;
         if (currentSpeakerMode === "single") {
-          const fullText = dialogueData.map(d => d.text).join('\n\n');
+          const fullText = dialogueData.map(d => d.text.replace(/[\*_]/g, "").trim()).join('\n\n');
           payload = {
             contents: [{
               parts: [{ text: fullText }]
@@ -2043,18 +2114,7 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
             }
           };
 
-          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-          const response = await fetch(apiUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-
-          const resJson = await response.json();
+          const resJson = await callGeminiTextModel(payload);
           let rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawText) {
             rawText = rawText.replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/, '').trim();
@@ -2145,18 +2205,7 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
             }
           };
 
-          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-          const response = await fetch(apiUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-
-          const resJson = await response.json();
+          const resJson = await callGeminiTextModel(payload);
           const rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
           const translations = JSON.parse(rawText);
 
