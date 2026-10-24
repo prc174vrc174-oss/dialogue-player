@@ -1,6 +1,8 @@
 # 🎙️ 多國語言雙角色語音播放器 (Multilingual AI Dialogue & Shadowing Player)
 
 > 🚀 **純前端・零後端・安全開源**：專為語言學習者與口語跟讀（Shadowing）設計的高音質真人發音網頁播放器。搭載 Google Gemini AI 最新語音合成技術與多國語言即時辭典。
+>
+> 🌐 **線上體驗網址 (Live Demo)**：[https://prc174vrc174-oss.github.io/dialogue-player/](https://prc174vrc174-oss.github.io/dialogue-player/)
 
 ---
 
