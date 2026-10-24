@@ -78,6 +78,24 @@
       </div>
     </header>
 
+    <!-- 行動裝置聲音排查提示橫幅 (未設定 API Key 時顯示) -->
+    <div id="mobileTipBanner" class="hidden p-3.5 rounded-xl bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 text-amber-900 text-xs space-y-1.5 shadow-sm">
+      <div class="flex items-center justify-between font-bold">
+        <span class="flex items-center gap-1.5 text-amber-800">
+          <i class="fa-solid fa-mobile-screen text-amber-600 text-sm"></i> 📱 手機無聲音排查提醒
+        </span>
+        <button onclick="dismissMobileBanner()" class="text-amber-500 hover:text-amber-800 p-1">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+      <p class="leading-relaxed text-[11px] text-amber-800">
+        💡 <b>尚未在此手機輸入 API Key</b>：目前切換至手機內建語音模式。建議點擊右上角「<button onclick="openSettingsModal()" class="underline font-bold text-indigo-700">⚙️ 設定</button>」貼上您的 Gemini API Key，即可啟用高音質真人音色！
+      </p>
+      <p class="text-[10px] text-amber-700 leading-normal">
+        🔔 <b>iPhone 使用者必看</b>：若聽不到聲音，請確認手機左側<b>「實體靜音開關（勿見橘紅色標記）」已切換為響鈴</b>，並將側邊媒體音量調大！
+      </p>
+    </div>
+
     <!-- 自訂文字貼上與編輯區 (多國語言版) -->
     <section class="bg-white rounded-2xl p-4 shadow-sm border border-slate-200 space-y-3">
       
@@ -1468,8 +1486,9 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       document.getElementById("toastBox").classList.add("hidden");
     };
 
-    // 聲音硬體與 Gemini 連線測試 (支援多國語言)
+    // 聲音硬體與 Gemini 連線測試 (相容手機 Safari/Chrome)
     testSoundBtn.addEventListener("click", async () => {
+      primeMobileAudio();
       const apiKey = getApiKey();
       const origHtml = testSoundBtn.innerHTML;
       const langInfo = languages[currentLanguage] || languages.en;
@@ -1493,12 +1512,11 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
             }
           };
           const audioUrl = await fetchGeminiTTSWithRetry(payload, 2);
-          const testAudio = new Audio(audioUrl);
-          await testAudio.play();
-          showToast(`Gemini 真人音色（${selectedVoice}・${langInfo.name}）連線成功！正在播放測試語音。`, "success");
+          await playAudioUniversal(singleAudio, audioUrl, 1.0, null, () => playWebAudioBeep());
+          showToast(`Gemini 真人音色（${selectedVoice}・${langInfo.name}）連線成功！正在發音。`, "success");
         } catch (err) {
           console.error("Test sound failed:", err);
-          showToast(`Gemini 連線失敗（${err.message || '未知錯誤'}），已播放本機蜂鳴測試音。`, "error");
+          showToast(`Gemini 連線失敗（${err.message || '未知錯誤'}），已播放測試蜂鳴音。`, "error");
           playWebAudioBeep();
         } finally {
           testSoundBtn.disabled = false;
@@ -1506,25 +1524,27 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
         }
       } else {
         playWebAudioBeep();
-        showToast("尚未輸入 Gemini API Key，已播放本機蜂鳴測試音。請在下方輸入 API Key 啟用真人音色！", "info");
+        speakFallbackSingle(langInfo.testGreeting, "A");
+        showToast("尚未在此手機輸入 Gemini API Key，已播放手機提示音。請在下方輸入 API Key 啟用真人音色！", "info");
       }
     });
 
     function playWebAudioBeep() {
       try {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        const ctx = new AudioCtx();
-        if (ctx.state === 'suspended') ctx.resume();
+        const ctx = getGlobalAudioContext();
+        if (!ctx) return;
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
         osc.type = "sine";
-        osc.frequency.setValueAtTime(523.25, ctx.currentTime);
-        gain.gain.setValueAtTime(0.15, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+        // 雙音響鈴 (587Hz -> 880Hz) 確保手機喇叭清晰可聞
+        osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+        osc.frequency.setValueAtTime(880.00, ctx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.25, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
         osc.connect(gain);
         gain.connect(ctx.destination);
         osc.start();
-        osc.stop(ctx.currentTime + 0.35);
+        osc.stop(ctx.currentTime + 0.45);
       } catch (e) {}
     }
 
@@ -1676,6 +1696,11 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       mainAudio.pause();
       mainAudio.currentTime = 0;
 
+      if (currentWebAudioSource) {
+        try { currentWebAudioSource.stop(); } catch (e) {}
+        currentWebAudioSource = null;
+      }
+
       if (window.speechSynthesis) {
         window.speechSynthesis.cancel();
       }
@@ -1698,6 +1723,7 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
 
     // 單句播放切換
     window.toggleSingleLineAudio = async function(idx) {
+      primeMobileAudio();
       if (currentPlayingIdx === idx) {
         stopAllPlayback();
         audioStatusText.textContent = "已停止播放";
@@ -1713,6 +1739,7 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
 
     // 逐句播放控制
     playSequentialBtn.addEventListener("click", () => {
+      primeMobileAudio();
       if (dialogueData.length === 0) {
         showToast("目前沒有對話可播放，請先貼上對話！", "error");
         return;
@@ -1733,6 +1760,134 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       currentIteration = 1;
       executeSingleLinePlay(0);
     });
+
+    // 行動裝置專用：全域 AudioContext 與萬用解鎖機制
+    window.globalAudioCtx = null;
+    let currentWebAudioSource = null;
+
+    function getGlobalAudioContext() {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return null;
+      if (!window.globalAudioCtx) {
+        window.globalAudioCtx = new AudioCtx();
+      }
+      if (window.globalAudioCtx && window.globalAudioCtx.state === 'suspended') {
+        window.globalAudioCtx.resume().catch(() => {});
+      }
+      return window.globalAudioCtx;
+    }
+
+    // 立即解鎖行動瀏覽器音訊物件 (防止 iOS / Android 異步 await 造成手勢逾時被瀏覽器阻擋)
+    function primeMobileAudio() {
+      getGlobalAudioContext();
+
+      const silentWav = "data:audio/wav;base64,UklGRigAAABXQVZFRm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+
+      try {
+        if (singleAudio.paused && !singleAudio.src.startsWith("blob:")) {
+          singleAudio.src = silentWav;
+          const p = singleAudio.play();
+          if (p && p.catch) p.catch(() => {});
+        }
+      } catch (e) {}
+
+      try {
+        if (mainAudio.paused && !mainAudio.src.startsWith("blob:")) {
+          mainAudio.src = silentWav;
+          const p = mainAudio.play();
+          if (p && p.catch) p.catch(() => {});
+        }
+      } catch (e) {}
+
+      try {
+        if (wordAudio.paused && !wordAudio.src.startsWith("blob:")) {
+          wordAudio.src = silentWav;
+          const p = wordAudio.play();
+          if (p && p.catch) p.catch(() => {});
+        }
+      } catch (e) {}
+    }
+
+    // 萬用行動裝置相容音訊播放器 (優先 HTML5，失敗時自動 Web Audio 解碼播放)
+    async function playAudioUniversal(audioEl, blobUrl, speed, onEnded, onError) {
+      if (!audioEl) {
+        if (onError) onError(new Error("No audio element"));
+        return;
+      }
+
+      audioEl.src = blobUrl;
+      audioEl.playbackRate = speed || 1.0;
+
+      let endedTriggered = false;
+      const handleEnded = () => {
+        if (endedTriggered) return;
+        endedTriggered = true;
+        if (onEnded) onEnded();
+      };
+
+      audioEl.onended = handleEnded;
+
+      audioEl.onerror = async (err) => {
+        console.warn("HTML5 audio.onerror on mobile, attempting WebAudio fallback:", err);
+        const success = await playWavViaWebAudio(blobUrl, speed, handleEnded);
+        if (!success && onError) {
+          onError(err);
+        }
+      };
+
+      try {
+        const playPromise = audioEl.play();
+        if (playPromise !== undefined) {
+          await playPromise;
+          audioEl.playbackRate = speed || 1.0;
+        }
+      } catch (err) {
+        console.warn("HTML5 audio.play() blocked on mobile, falling back to WebAudio:", err);
+        const success = await playWavViaWebAudio(blobUrl, speed, handleEnded);
+        if (!success && onError) {
+          onError(err);
+        }
+      }
+    }
+
+    // Web Audio WAV 解碼播放備援 (徹底免疫 iOS Safari 自動播放政策阻擋)
+    async function playWavViaWebAudio(blobUrl, speed, onEnded) {
+      try {
+        const ctx = getGlobalAudioContext();
+        if (!ctx) return false;
+        if (ctx.state === 'suspended') {
+          await ctx.resume();
+        }
+
+        if (currentWebAudioSource) {
+          try { currentWebAudioSource.stop(); } catch (e) {}
+          currentWebAudioSource = null;
+        }
+
+        const res = await fetch(blobUrl);
+        const arrayBuf = await res.arrayBuffer();
+        const audioBuf = await ctx.decodeAudioData(arrayBuf);
+
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuf;
+        source.playbackRate.value = speed || 1.0;
+        source.connect(ctx.destination);
+
+        source.onended = () => {
+          if (currentWebAudioSource === source) {
+            currentWebAudioSource = null;
+          }
+          if (onEnded) onEnded();
+        };
+
+        source.start(0);
+        currentWebAudioSource = source;
+        return true;
+      } catch (e) {
+        console.error("playWavViaWebAudio failed:", e);
+        return false;
+      }
+    }
 
     // 執行單句發音
     async function executeSingleLinePlay(idx) {
@@ -1779,19 +1934,13 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
         }
 
         btn.innerHTML = `<i class="fa-solid fa-stop text-rose-500 text-lg"></i>`;
-        singleAudio.src = cachedLineUrls[idx];
-        singleAudio.playbackRate = currentSpeed;
-
-        singleAudio.onended = () => {
-          handleSingleLineCompletion(idx);
-        };
-
-        singleAudio.onerror = () => {
-          speakFallbackSingle(item.text, (currentSpeakerMode === "single" ? "A" : item.role), () => handleSingleLineCompletion(idx));
-        };
-
-        await singleAudio.play();
-        singleAudio.playbackRate = currentSpeed;
+        await playAudioUniversal(
+          singleAudio,
+          cachedLineUrls[idx],
+          currentSpeed,
+          () => handleSingleLineCompletion(idx),
+          () => speakFallbackSingle(item.text, (currentSpeakerMode === "single" ? "A" : item.role), () => handleSingleLineCompletion(idx))
+        );
       } catch (e) {
         console.error("Single line play error:", e);
         btn.innerHTML = `<i class="fa-solid fa-stop text-rose-500 text-lg"></i>`;
@@ -1915,13 +2064,20 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
         const wavUrl = await fetchGeminiTTSWithRetry(payload);
         cachedFullAudioUrl = wavUrl;
 
-        mainAudio.src = wavUrl;
-        mainAudio.playbackRate = currentSpeed;
         audioContainer.classList.remove("hidden");
         downloadAudioBtn.classList.remove("hidden");
         downloadAudioBtn.classList.add("flex");
 
-        await mainAudio.play();
+        await playAudioUniversal(
+          mainAudio,
+          wavUrl,
+          currentSpeed,
+          () => {
+            highlightLine(-1);
+            updatePlayButtonState();
+          },
+          () => playFallbackFull()
+        );
         showToast((currentSpeakerMode === "single") ? "已成功連線 Gemini 生成真人朗讀語音！" : "已成功連線 Gemini 生成雙角色真人語音！", "success");
       } catch (err) {
         console.error("TTS error:", err);
@@ -1939,23 +2095,26 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       }
     }
 
-    // 瀏覽器本地語音備援 (單句，支援多國語言與男女音色)
+    // 瀏覽器本地語音備援 (單句，支援多國語言與男女音色，相容 iOS/Android)
     function speakFallbackSingle(text, role, onEnd) {
       if (!('speechSynthesis' in window)) {
         if (onEnd) onEnd();
         return;
       }
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.resume();
-      const u = new SpeechSynthesisUtterance(text);
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {}
+
+      const cleanText = text.replace(/[\*_]/g, "").trim();
+      const u = new SpeechSynthesisUtterance(cleanText);
       const langInfo = languages[currentLanguage] || languages.en;
       u.lang = langInfo.bcp47;
-      u.rate = currentSpeed * 0.95;
+      u.rate = currentSpeed * 0.92;
 
       const voices = window.speechSynthesis.getVoices();
       if (voices.length > 0) {
         const langPrefix = langInfo.bcp47.slice(0, 2).toLowerCase();
-        const matchedVoices = voices.filter(v => v.lang.toLowerCase().startsWith(langPrefix));
+        const matchedVoices = voices.filter(v => v.lang.toLowerCase().replace('_', '-').startsWith(langPrefix));
         if (matchedVoices.length > 0) {
           const selectedVoiceName = (role === "A" || currentSpeakerMode === "single") ? voiceASelect.value : voiceBSelect.value;
           const gender = (voiceMetadata[selectedVoiceName]?.gender) || (role === "A" ? "female" : "male");
@@ -1969,9 +2128,24 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
         }
       }
 
-      u.onend = () => { if (onEnd) onEnd(); };
-      u.onerror = () => { if (onEnd) onEnd(); };
-      window.speechSynthesis.speak(u);
+      let ended = false;
+      const finish = () => {
+        if (ended) return;
+        ended = true;
+        if (onEnd) onEnd();
+      };
+
+      u.onend = finish;
+      u.onerror = finish;
+
+      // iOS Safari 需延遲 40ms 發音以防 cancel 互相干擾
+      setTimeout(() => {
+        try {
+          window.speechSynthesis.speak(u);
+        } catch (e) {
+          finish();
+        }
+      }, 40);
     }
 
     // 瀏覽器本地語音備援 (整篇)
@@ -2024,7 +2198,10 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
     }
 
     // 事件監聽綁定
-    generateAudioBtn.addEventListener("click", playFullDialogue);
+    generateAudioBtn.addEventListener("click", () => {
+      primeMobileAudio();
+      playFullDialogue();
+    });
     stopAudioBtn.addEventListener("click", stopAllPlayback);
 
     mainAudio.addEventListener("play", updatePlayButtonState);
@@ -2307,6 +2484,29 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
       }
     });
 
+        // 行動裝置橫幅提示管理
+    function checkMobileTipBanner() {
+      const banner = document.getElementById("mobileTipBanner");
+      if (!banner) return;
+      const dismissed = sessionStorage.getItem("mobile_banner_dismissed");
+      const hasKey = !!getApiKey();
+      if (!hasKey && !dismissed) {
+        banner.classList.remove("hidden");
+      } else {
+        banner.classList.add("hidden");
+      }
+    }
+
+    window.dismissMobileBanner = function() {
+      const banner = document.getElementById("mobileTipBanner");
+      if (banner) banner.classList.add("hidden");
+      sessionStorage.setItem("mobile_banner_dismissed", "true");
+    };
+
+    // 觸控螢幕第一次點擊時解鎖音訊
+    window.addEventListener("touchstart", primeMobileAudio, { once: true });
+    window.addEventListener("click", primeMobileAudio, { once: true });
+
     saveApiKeyBtn.addEventListener("click", () => {
       const key = apiKeyInput.value.trim();
       if (!key) {
@@ -2316,6 +2516,7 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
       localStorage.setItem("gemini_api_key", key);
       updateApiKeyStatus(true);
       resetAudioCache();
+      checkMobileTipBanner();
       showToast("Gemini API Key 已成功儲存！已啟用雲端高音質真人語音與 AI 字典。", "success");
     });
 
@@ -2324,6 +2525,7 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
       apiKeyInput.value = "";
       updateApiKeyStatus(false);
       resetAudioCache();
+      checkMobileTipBanner();
       showToast("已清除 API Key，將切換為本機瀏覽器語音與離線字典備援模式。", "info");
     });
 
@@ -2378,6 +2580,7 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
     updateChineseToggleState();
     setSpeakerMode(currentSpeakerMode, false);
     setTargetLanguage(currentLanguage, true);
+    checkMobileTipBanner();
   </script>
 </body>
 </html>
