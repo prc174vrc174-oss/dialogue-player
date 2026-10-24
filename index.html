@@ -1144,16 +1144,84 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       }
     };
 
-    // 呼叫 Gemini 語言文字模型 (支援 gemini-2.0-flash 與自動多模型容錯降級)
+    // 快取可用 Gemini 文字模型與 API Key
+    let cachedAvailableTextModels = null;
+    let cachedApiKeyForTextModels = null;
+
+    // 動態向 ModelService.ListModels 獲取該 API Key 實際支援之 generateContent 模型清單
+    async function getAvailableTextModels(apiKey) {
+      if (cachedAvailableTextModels && cachedApiKeyForTextModels === apiKey) {
+        return cachedAvailableTextModels;
+      }
+
+      // 現代化標準候選模型清單 (剔除已廢棄或不支援的 -latest 別名)
+      const defaultCandidates = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-002",
+        "gemini-1.5-flash-001",
+        "gemini-1.5-pro"
+      ];
+
+      try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data?.models)) {
+            // 篩選支援 generateContent 且排除 tts、embedding、imagen 等非對話生成模型
+            const discovered = data.models
+              .filter(m => {
+                const methods = m.supportedGenerationMethods || [];
+                const name = (m.name || "").toLowerCase();
+                return methods.includes("generateContent") &&
+                       !name.includes("tts") &&
+                       !name.includes("embedding") &&
+                       !name.includes("imagen") &&
+                       !name.includes("aqa");
+              })
+              .map(m => m.name.replace(/^models\//, ''));
+
+            if (discovered.length > 0) {
+              const priorityOrder = [
+                "gemini-2.5-flash",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash",
+                "gemini-1.5-flash-002",
+                "gemini-1.5-flash-001",
+                "gemini-2.0-flash-lite",
+                "gemini-1.5-pro"
+              ];
+
+              const sorted = [];
+              for (const p of priorityOrder) {
+                if (discovered.includes(p)) sorted.push(p);
+              }
+              for (const d of discovered) {
+                if (!sorted.includes(d)) sorted.push(d);
+              }
+
+              cachedAvailableTextModels = sorted;
+              cachedApiKeyForTextModels = apiKey;
+              return sorted;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("無法動態取得 Gemini 模型列表，使用內建候選清單：", e);
+      }
+
+      cachedAvailableTextModels = defaultCandidates;
+      cachedApiKeyForTextModels = apiKey;
+      return defaultCandidates;
+    }
+
+    // 呼叫 Gemini 語言文字模型 (支援動態模型偵測與自動多模型容錯切換)
     async function callGeminiTextModel(payload) {
       const apiKey = getApiKey();
       if (!apiKey) throw new Error("未設定 API Key");
 
-      const candidateModels = [
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest"
-      ];
+      const candidateModels = await getAvailableTextModels(apiKey);
       let lastError = null;
 
       for (const model of candidateModels) {
@@ -1172,13 +1240,19 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
           const errData = await response.json().catch(() => null);
           const msg = errData?.error?.message || `HTTP ${response.status}`;
           lastError = new Error(msg);
-          // 若遇 404 (模型名稱不相容) 或 429，嘗試下一個候選模型
-          if (response.status === 404 || response.status === 429) {
-            continue;
+
+          // 若為 API Key 無效，無須重複嘗試其他模型
+          if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+            throw lastError;
           }
-          break;
+
+          // 其他錯誤 (404 模型不相容、429 額度超限、500/503 伺服器異常等) 繼續嘗試下一個可用模型
+          continue;
         } catch (e) {
           lastError = e;
+          if (e.message && (e.message.includes("API_KEY_INVALID") || e.message.includes("API key not valid"))) {
+            throw e;
+          }
         }
       }
       throw lastError || new Error("無法連線至 Gemini 文字模型");
@@ -1230,7 +1304,8 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       const result = await callGeminiTextModel(payload);
       const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!text) throw new Error("無回傳內容");
-      return JSON.parse(text);
+      const cleanJson = text.replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/, '').trim();
+      return JSON.parse(cleanJson);
     }
 
     // 備援字典查詢 (支援 MyMemory 中文釋義與 FreeDictionary 發音)
@@ -1649,6 +1724,7 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       const candidateModels = payload.models || (payload.model ? [payload.model] : [
         "gemini-3.8-flash-lite-tts",
         "gemini-3.8-flash-tts",
+        "gemini-2.5-flash-preview-tts",
         "gemini-3.1-flash-tts-preview"
       ]);
 
@@ -2333,15 +2409,16 @@ B: อ้าว ผมคิดว่ามันซาบซึ้งดีน�
       try {
         const apiKey = getApiKey();
         if (apiKey) {
-          const prompt = isSingle
-            ? `請將以下繁體中文短文或句子翻譯成自然地道的「${langInfo.name}」（${langInfo.bcp47}），維持清晰自然流暢的口吻。
+          try {
+            const prompt = isSingle
+              ? `請將以下繁體中文短文或句子翻譯成自然地道的「${langInfo.name}」（${langInfo.bcp47}），維持清晰自然流暢的口吻。
 請逐句/逐段輸出，每句輸出格式必須為：
 [${langInfo.name}道地句子] ([原始繁體中文])
 例如：
 [${langInfo.name}翻譯] (歡迎來到今天的學習課堂。)
 
 請只輸出翻譯，不要包含角色標籤（不要加 A: 或 B: 前綴），也不要輸出任何額外開場白、解說文字或 Markdown 程式碼區塊標記：\n${text}`
-            : `請將以下雙角色中文對話翻譯成地道自然的生活化「${langInfo.name}」（${langInfo.bcp47}），維持朋友間輕鬆自然的日常交談語氣與生活用詞。
+              : `請將以下雙角色中文對話翻譯成地道自然的生活化「${langInfo.name}」（${langInfo.bcp47}），維持朋友間輕鬆自然的日常交談語氣與生活用詞。
 請嚴格保留「A: / B:」說話者前綴，每句輸出格式必須為：
 [說話者]: [${langInfo.name}道地句子] ([原始繁體中文])
 例如：
@@ -2350,24 +2427,27 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
 
 請只輸出對話，不要輸出任何額外開場白、解說文字或 Markdown 程式碼區塊標記：\n${text}`;
 
-          const payload = {
-            contents: [{
-              role: "user",
-              parts: [{ text: prompt }]
-            }],
-            generationConfig: {
-              temperature: 0.3
-            }
-          };
+            const payload = {
+              contents: [{
+                role: "user",
+                parts: [{ text: prompt }]
+              }],
+              generationConfig: {
+                temperature: 0.3
+              }
+            };
 
-          const resJson = await callGeminiTextModel(payload);
-          let rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (rawText) {
-            rawText = rawText.replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/, '').trim();
-            scriptInput.value = rawText;
-            applyScript();
-            showToast(`已成功將中文轉換為道地${langInfo.name}，可立即點聽真人發音！`, "success");
-            return;
+            const resJson = await callGeminiTextModel(payload);
+            let rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (rawText) {
+              rawText = rawText.replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/, '').trim();
+              scriptInput.value = rawText;
+              applyScript();
+              showToast(`已成功將中文轉換為道地${langInfo.name}，可立即點聽真人發音！`, "success");
+              return;
+            }
+          } catch (geminiErr) {
+            console.warn("Gemini AI 翻譯未完成，自動切換至備援翻譯器：", geminiErr);
           }
         }
 
@@ -2438,35 +2518,40 @@ B: [${langInfo.name}翻譯] (有啊，我看了。我真的很喜歡。)
 
       try {
         if (apiKey) {
-          const linesPrompt = dialogueData.map((d, i) => `${i + 1}. ${d.text}`).join('\n');
-          const payload = {
-            contents: [{
-              role: "user",
-              parts: [{
-                text: `請將以下「${langInfo.name}」生活對話逐句翻譯成自然地道的台灣繁體中文，保持每句原本口氣與生活化。請直接以 JSON 陣列格式回傳翻譯結果（格式為：["譯文1", "譯文2", ...]），請勿輸出 Markdown 程式碼區塊標記或其他多餘文字：\n${linesPrompt}`
-              }]
-            }],
-            generationConfig: {
-              responseMimeType: "application/json"
-            }
-          };
-
-          const resJson = await callGeminiTextModel(payload);
-          const rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
-          const translations = JSON.parse(rawText);
-
-          if (Array.isArray(translations)) {
-            translations.forEach((trans, idx) => {
-              if (dialogueData[idx]) {
-                dialogueData[idx].translation = trans.trim();
+          try {
+            const linesPrompt = dialogueData.map((d, i) => `${i + 1}. ${d.text}`).join('\n');
+            const payload = {
+              contents: [{
+                role: "user",
+                parts: [{
+                  text: `請將以下「${langInfo.name}」生活對話逐句翻譯成自然地道的台灣繁體中文，保持每句原本口氣與生活化。請直接以 JSON 陣列格式回傳翻譯結果（格式為：["譯文1", "譯文2", ...]），請勿輸出 Markdown 程式碼區塊標記或其他多餘文字：\n${linesPrompt}`
+                }]
+              }],
+              generationConfig: {
+                responseMimeType: "application/json"
               }
-            });
-            showChinese = true;
-            localStorage.setItem("show_chinese_translation", "true");
-            updateChineseToggleState();
-            renderDialogue();
-            showToast("已成功透過 Gemini 完成整篇對話繁體中文翻譯！", "success");
-            return;
+            };
+
+            const resJson = await callGeminiTextModel(payload);
+            const rawText = resJson?.candidates?.[0]?.content?.parts?.[0]?.text;
+            const cleanJson = (rawText || "").replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/, '').trim();
+            const translations = JSON.parse(cleanJson);
+
+            if (Array.isArray(translations)) {
+              translations.forEach((trans, idx) => {
+                if (dialogueData[idx]) {
+                  dialogueData[idx].translation = trans.trim();
+                }
+              });
+              showChinese = true;
+              localStorage.setItem("show_chinese_translation", "true");
+              updateChineseToggleState();
+              renderDialogue();
+              showToast("已成功透過 Gemini 完成整篇對話繁體中文翻譯！", "success");
+              return;
+            }
+          } catch (geminiErr) {
+            console.warn("Gemini 自動翻譯對話未完成，自動切換至備援翻譯器：", geminiErr);
           }
         }
 
